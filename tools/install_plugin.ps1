@@ -18,9 +18,7 @@ New-Item -ItemType Directory -Force $dest | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $dest "icons") | Out-Null
 Copy-Item $Exe (Join-Path $dest "tracewright.exe") -Force
 Copy-Item (Join-Path $root "plugin\icons\*.png") (Join-Path $dest "icons") -Force
-# KiCad resolves the entry point itself; an absolute path works regardless of version details.
-$manifest = Get-Content (Join-Path $root "plugin\plugin.json") -Raw | ConvertFrom-Json
-$manifest.actions[0].entrypoint = (Join-Path $dest "tracewright.exe")
-$json = $manifest | ConvertTo-Json -Depth 10
-[IO.File]::WriteAllText((Join-Path $dest "plugin.json"), $json, (New-Object Text.UTF8Encoding($false)))
+# KiCad skips actions whose entrypoint is an absolute path (common/api/api_plugin.cpp), so the
+# manifest's relative "tracewright.exe" is copied unchanged.
+Copy-Item (Join-Path $root "plugin\plugin.json") (Join-Path $dest "plugin.json") -Force
 Write-Host "Installed to $dest"

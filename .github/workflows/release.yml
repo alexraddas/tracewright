@@ -1,0 +1,154 @@
+name: Release
+
+# Push a tag matching the Cargo.toml version (e.g. v0.2.0) to build every platform, package the
+# plugin for KiCad's Plugin and Content Manager, and publish a GitHub Release with:
+#   tracewright-<ver>-<platform>.zip       PCM package (Install from File...)
+#   tracewright-cli-<ver>-<platform>.zip   command-line router
+#   packages.json, repository.json         PCM repository; users add
+#     https://github.com/<owner>/<repo>/releases/latest/download/repository.json
+# Pull requests that touch the packaging, and workflow_dispatch, build and package without
+# publishing, as a dry run.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - tools/package_pcm.py
+      - plugin/**
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: macos
+            os: macos-latest
+          # Oldest supported hosted Ubuntu, so the binary runs on older glibc.
+          - platform: linux
+            os: ubuntu-22.04
+          - platform: windows
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$v" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version $v" >&2; exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libwayland-dev libxkbcommon-dev
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked --release --bins --target aarch64-apple-darwin
+          cargo build --locked --release --bins --target x86_64-apple-darwin
+          mkdir -p out
+          for b in tracewright tracewright-cli; do
+            lipo -create -output out/$b target/aarch64-apple-darwin/release/$b target/x86_64-apple-darwin/release/$b
+            # lipo invalidates the per-slice ad-hoc signatures; Apple Silicon refuses unsigned code.
+            codesign --force --sign - out/$b
+          done
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --release --bins
+          mkdir -p out && cp target/release/tracewright target/release/tracewright-cli out/
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          # Static CRT: no dependency on the Visual C++ redistributable.
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --locked --release --bins
+          mkdir -p out && cp target/release/tracewright.exe target/release/tracewright-cli.exe out/
+      - name: Package
+        shell: bash
+        run: |
+          v=${{ steps.ver.outputs.version }}
+          ext=$([ "${{ matrix.platform }}" = windows ] && echo .exe || true)
+          python3 tools/package_pcm.py package --platform ${{ matrix.platform }} --exe out/tracewright$ext --version $v --out dist
+          python3 - "$v" "${{ matrix.platform }}" "$ext" <<'EOF'
+          import sys, zipfile
+          v, plat, ext = sys.argv[1:]
+          with zipfile.ZipFile(f"dist/tracewright-cli-{v}-{plat}.zip", "w", zipfile.ZIP_DEFLATED) as z:
+              info = zipfile.ZipInfo(f"tracewright-cli{ext}", date_time=(2024, 1, 1, 0, 0, 0))
+              info.create_system = 3; info.external_attr = 0o100755 << 16; info.compress_type = zipfile.ZIP_DEFLATED
+              z.writestr(info, open(f"out/tracewright-cli{ext}", "rb").read())
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Build PCM repository
+        id: repo
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          python3 tools/package_pcm.py repo --version "$v" \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v$v" \
+            --packages-url "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/packages.json" \
+            --out dist $(ls dist/tracewright-$v-*.zip)
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: dist/*
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=${{ steps.repo.outputs.version }}
+          cat > notes.md <<EOF
+          ## Install in KiCad 10
+
+          Turn on **Preferences → Plugins → Enable KiCad API** first.
+
+          **One-click, with updates:** in the KiCad project manager, open **Plugin and Content Manager → Manage…**, add this repository URL, then install *Tracewright GPU Autorouter*:
+
+              https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/repository.json
+
+          **From a file:** download the zip for your platform below, then **Plugin and Content Manager → Install from File…**
+
+          Restart the PCB Editor; the **Tracewright: Autoroute** button appears in its toolbar.
+
+          | File | For |
+          |---|---|
+          | \`tracewright-$v-macos.zip\` | macOS (Apple Silicon and Intel) |
+          | \`tracewright-$v-windows.zip\` | Windows x64 |
+          | \`tracewright-$v-linux.zip\` | Linux x86_64 |
+          | \`tracewright-cli-$v-*.zip\` | Command-line router (optional) |
+          EOF
+          gh release create "v$v" dist/* --title "Tracewright $v" --notes-file notes.md --verify-tag
