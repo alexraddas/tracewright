@@ -115,8 +115,10 @@ pub struct StaticMaps {
     /// Routable layers (from settings) and per-layer plane net.
     pub routable: Vec<bool>,
     pub plane_net: Vec<Option<NetId>>,
-    /// Neck-down track width per net class.
+    /// Neck-down track width per net class (the narrowest rung).
     pub neck_w: Vec<f64>,
+    /// Per net class: neck-down rungs, widest first, as (trace probe, width).
+    pub neck_ladder: Vec<Vec<(usize, f64)>>,
     /// Per plane layer: nodes where a via of the plane net lands fully inside the plane's
     /// copper (its zone fill on that layer, eroded by the via radius). `None` when the board has
     /// no zone for the plane net on that layer (the whole layer is then taken as copper).
@@ -257,6 +259,12 @@ impl StaticMaps {
                 via: find_or_add(Probe { kind: ProbeKind::Via, half: nc.via_diameter / 2.0, clearance: nc.clearance, drill: nc.via_drill }),
                 neck: find_or_add(Probe { kind: ProbeKind::Trace, half: neck_w[ci] / 2.0, clearance: nc.clearance, drill: 0.0 }),
             })
+            .collect();
+        let neck_ladder: Vec<Vec<(usize, f64)>> = settings
+            .neck_ladders(board)
+            .iter()
+            .zip(&settings.netclasses)
+            .map(|(ws, nc)| ws.iter().map(|&w| (find_or_add(Probe { kind: ProbeKind::Trace, half: w / 2.0, clearance: nc.clearance, drill: 0.0 }), w)).collect())
             .collect();
 
         let routable: Vec<bool> = (0..nl).map(|l| settings.layers.get(l).map(|c| c.routable && c.plane_net.is_none()).unwrap_or(true)).collect();
@@ -470,7 +478,7 @@ impl StaticMaps {
             })
             .collect();
 
-        StaticMaps { grid, probes, class_probes, owner, comfort, via_in_pad, routable, plane_net, neck_w, plane_cover }
+        StaticMaps { grid, probes, class_probes, owner, comfort, via_in_pad, routable, plane_net, neck_w, neck_ladder, plane_cover }
     }
 
     /// True if a via of the plane net at plane-local node `p` lands on plane `layer`'s copper.
