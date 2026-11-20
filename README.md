@@ -8,8 +8,14 @@ construction.
 ## Using it
 
 1. In KiCad: **Preferences → Plugins → Enable KiCad API** (must be on).
-2. Install: `tools\install_plugin.ps1` (copies `dist\tracewright.exe`, the manifest and icons
-   to `Documents\KiCad\10.0\plugins\com.tracewright.router`). Restart the PCB Editor.
+2. Install, then restart the PCB Editor:
+   * Windows: `tools\install_plugin.ps1` (copies `dist\tracewright.exe`, the manifest and icons
+     to `Documents\KiCad\10.0\plugins\com.tracewright.router`).
+   * macOS / Linux: `tools/install_plugin.sh` (copies `target/release/tracewright` to
+     `~/Documents/KiCad/10.0/plugins/com.tracewright.router` on macOS, or
+     `~/.local/share/kicad/10.0/plugins/...` on Linux). The binary is unsigned: a copy you
+     downloaded rather than built carries Gatekeeper's quarantine flag, which the script removes
+     (`xattr -d com.apple.quarantine`); otherwise macOS refuses to launch it from KiCad.
 3. Click **Tracewright: Autoroute** in the PCB Editor toolbar. The window shows:
    * **Design rules** per net class (clearance, track width, via size/drill), copper-to-edge,
      hole clearance, hole-to-hole, pre-filled from the board and its `.kicad_pro`.
@@ -63,6 +69,14 @@ into the running PCB editor as one undo step and saved; KiCad DRC clean.
 
 ## Building
 
+Needs Rust 1.95 or newer (egui/eframe 0.37). CI (`.github/workflows/ci.yml`) builds and runs
+`cargo test --lib` on macOS arm64 (Metal, GPU tests required to run), Linux and Windows (no GPU on
+those runners, so only the CPU tests run there).
+
+macOS (Apple Silicon): `cargo build --release`; the GPU backend uses Metal. Linux:
+`cargo build --release` (needs `libfontconfig1-dev`, `libwayland-dev`, `libxkbcommon-dev`);
+the GPU backend uses Vulkan.
+
 Rust (GNU toolchain) on Windows without Visual Studio: `~/.cargo/config.toml` points rustc at
 LLVM's dlltool and links with LLD (`lld-as-ld\ld.exe`, a copy of `rust-lld.exe`) because GNU ld
 mis-links LLVM import libraries. Then `cargo build --release` and copy `tracewright.exe` to
@@ -79,11 +93,18 @@ Dev tools (KiCad's Python): `tools/kicad_dump.py` (board → JSON), `tools/kicad
   did not show in the KiCad 10.0.8 PCB Editor toolbar during testing (`pcbnew.json` →
   `plugins.actions` stayed empty), so KiCad may not be registering the plugin. Running the
   installed `tracewright.exe` directly while the PCB Editor is open works (it connects over the
-  default API socket). Needs investigation of KiCad's plugin discovery for `exec` plugins.
+  default API socket). Probable cause: KiCad 10 skips any action whose `entrypoint` is an
+  absolute path (`common/api/api_plugin.cpp`, "action contains abs path; skipping"), and
+  `install_plugin.ps1` writes an absolute one. `install_plugin.sh` keeps it relative; the Windows
+  script is unchanged until this is confirmed there.
 * Pads outside the board outline are skipped and reported separately ("pads outside the board
   outline skipped"); they are not counted as routing failures.
-* Windows only so far: the build setup, install script and font fallbacks target Windows; macOS
-  (Metal) and Linux need porting work.
+* macOS: the engine, tests and headless CLI are verified on Apple M4 Pro (Metal):
+  kit-dev-coldfire-xilinx routes 209/209 with output byte-identical to the CPU backend. The
+  plugin has not yet been launched from KiCad's toolbar on macOS. Throughput is about 3.5× below
+  the RTX 5080 (that board takes ~57 s on Metal vs ~37 s on the M4 Pro's CPU backend, all in the
+  relaxation kernels, not CPU-GPU round trips), so on Apple Silicon **Engine: CPU** can be
+  faster. Linux builds in CI but is untested on a real GPU.
 * Through vias only in the router (the engine supports blind/buried spans; not exposed yet).
 * Very dense boards with 2 signal layers and fine-pitch parts (RoyalBlue54L) do not converge yet.
 * Net-class widths are used as given: boards whose classes keep KiCad's stock 0.25 mm / 0.8 mm

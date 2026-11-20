@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon runners have a Metal GPU, so the GPU-vs-CPU tests must run there.
+          - name: macOS arm64 / Metal
+            os: macos-14
+            require_gpu: "1"
+          # The hosted Linux and Windows runners have no GPU: GPU tests skip, CPU tests run.
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            require_gpu: ""
+          - name: Windows x86_64 (MSVC)
+            os: windows-2022
+            require_gpu: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev libwayland-dev libxkbcommon-dev
+      - name: Build
+        run: cargo build --locked --release --bins
+      - name: Test
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.require_gpu }}" ]; then export TRACEWRIGHT_REQUIRE_GPU=1; fi
+          cargo test --locked --lib -- --nocapture
+      - name: GPU info
+        if: matrix.require_gpu != ''
+        run: ./target/release/tracewright-cli gpu-info
