@@ -18,7 +18,7 @@ jobs:
         include:
           # Apple Silicon runners have a Metal GPU, so the GPU-vs-CPU tests must run there.
           - name: macOS arm64 / Metal
-            os: macos-14
+            os: macos-latest
             require_gpu: "1"
           # The hosted Linux and Windows runners have no GPU: GPU tests skip, CPU tests run.
           - name: Linux x86_64
