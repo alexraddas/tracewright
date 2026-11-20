@@ -1,0 +1,9 @@
+# Build output
+/target/
+/dist/
+
+# Test boards and results (copies of KiCad demo boards; regenerate with tools/verify_board.ps1)
+/testdata/
+
+__pycache__/
+*.pyc

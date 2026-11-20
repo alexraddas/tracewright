@@ -1,0 +1,47 @@
+[package]
+name = "tracewright"
+version = "0.1.0"
+edition = "2024"
+description = "GPU-accelerated orthogonal PCB autorouter plugin for KiCad"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
+eframe = "0.37.0"
+pollster = "1.0.3"
+prost = "0.14.6"
+prost-types = "0.14.6"
+rayon = "1.12.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+wgpu = "30.0.2"
+
+[build-dependencies]
+prost-build = "0.14.6"
+prost = "0.14.6"
+prost-types = "0.14.6"
+
+[lib]
+name = "tracewright"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tracewright"
+path = "src/main.rs"
+
+[[bin]]
+name = "tracewright-cli"
+path = "src/bin/cli.rs"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

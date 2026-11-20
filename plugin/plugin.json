@@ -1,0 +1,21 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "com.tracewright.router",
+  "name": "Tracewright GPU Autorouter",
+  "description": "GPU-accelerated orthogonal autorouter for up to 8 copper layers, driven by your board's design rules.",
+  "runtime": {
+    "type": "exec"
+  },
+  "actions": [
+    {
+      "identifier": "tracewright.autoroute",
+      "name": "Tracewright: Autoroute",
+      "description": "Route the open board on the GPU with live preview, then apply the result as one undo step",
+      "show-button": true,
+      "scopes": ["pcb"],
+      "entrypoint": "tracewright.exe",
+      "icons-light": ["icons/icon-light-24.png", "icons/icon-light-48.png"],
+      "icons-dark": ["icons/icon-dark-24.png", "icons/icon-dark-48.png"]
+    }
+  ]
+}
