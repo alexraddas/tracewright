@@ -34,6 +34,12 @@ enum Cmd {
         /// Write the effective settings used.
         #[arg(long)]
         dump_settings: Option<PathBuf>,
+        /// Never neck down narrower than this (mm).
+        #[arg(long)]
+        min_neck: Option<f64>,
+        /// Rip up and re-route nets whose existing tracks are narrower than --min-neck.
+        #[arg(long)]
+        force_reroute: bool,
     },
     /// Show the GPU adapter the router would use.
     GpuInfo,
@@ -138,7 +144,7 @@ fn report(res: &tracewright::router::RouteResult) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Route { board, settings, out, svg, backend, pitch, dump_settings } => {
+        Cmd::Route { board, settings, out, svg, backend, pitch, dump_settings, min_neck, force_reroute } => {
             let mut b: Board = serde_json::from_str(&std::fs::read_to_string(&board).context("read board")?).context("parse board")?;
             b.normalize();
             let mut s = load_settings(&b, &settings)?;
@@ -146,11 +152,21 @@ fn main() -> Result<()> {
             if let Some(p) = pitch {
                 s.grid_pitch = p;
             }
+            if let Some(w) = min_neck {
+                s.min_neck_width = w;
+            }
+            if force_reroute {
+                s.force_reroute = true;
+            }
             if let Some(p) = dump_settings {
                 std::fs::write(p, serde_json::to_string_pretty(&s)?)?;
             }
             let res = run_route(&b, &s)?;
             report(&res);
+            if !res.rerouted_nets.is_empty() {
+                eprintln!("force re-route: {} net(s) ripped up ({} existing items to delete): {}", res.rerouted_nets.len(), res.removed_ids.len(), res.rerouted_nets.join(", "));
+            }
+            let b = tracewright::router::board_after(&b, &res);
             let viol = tracewright::drc::check_clearance(&b, &s, &res.segs, &res.vias, 1e-6);
             eprintln!("geometric DRC: {} clearance violations", viol.len());
             for v in viol.iter().take(10) {

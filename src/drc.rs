@@ -254,7 +254,15 @@ impl Dsu {
 
 /// Connected copper components among the copper items. Two items connect when they share a
 /// layer and touch. Items on a plane layer of their own net connect through the plane.
-pub fn copper_components(items: &[Item], plane_layers: &[(usize, NetId)]) -> Dsu {
+/// Copper polygons of each plane layer's net (its zones on that layer). Empty means no zone is
+/// known for it, and the whole layer is taken as plane copper.
+pub fn plane_polys(board: &Board, plane_layers: &[(usize, NetId)]) -> Vec<Vec<crate::geom::Polygon>> {
+    plane_layers.iter().map(|&(l, net)| board.zones.iter().filter(|z| z.net == net && z.layers.contains(&l)).map(|z| z.poly.clone()).collect()).collect()
+}
+
+/// Connected copper per net. An item joins a plane only where it actually sits on the plane's
+/// copper (`plane_polys`, aligned with `plane_layers`; empty = whole layer).
+pub fn copper_components(items: &[Item], plane_layers: &[(usize, NetId)], plane_polys: &[Vec<crate::geom::Polygon>]) -> Dsu {
     let copper: Vec<usize> = (0..items.len()).filter(|&i| is_copper(items[i].kind) && items[i].net != 0).collect();
     let mut dsu = Dsu::new(items.len() + plane_layers.len());
     // The per-layer shapes of one pad are a single conductor.
@@ -287,7 +295,11 @@ pub fn copper_components(items: &[Item], plane_layers: &[(usize, NetId)]) -> Dsu
         }
         for (pi, &(pl, pnet)) in plane_layers.iter().enumerate() {
             if it.net == pnet && it.layers & (1u64 << pl) != 0 {
-                dsu.union(copper[k], items.len() + pi);
+                let polys = plane_polys.get(pi).map(|v| v.as_slice()).unwrap_or(&[]);
+                let c = it.shape.bbox().center();
+                if polys.is_empty() || polys.iter().any(|p| p.contains(c)) {
+                    dsu.union(copper[k], items.len() + pi);
+                }
             }
         }
     }
@@ -297,7 +309,7 @@ pub fn copper_components(items: &[Item], plane_layers: &[(usize, NetId)]) -> Dsu
 /// Per net: number of pad groups that are still disconnected (0 = fully connected).
 pub fn unconnected_per_net(board: &Board, settings: &Settings, segs: &[Seg], vias: &[ViaOut], plane_layers: &[(usize, NetId)]) -> HashMap<NetId, usize> {
     let items = collect_items(board, settings, segs, vias, true);
-    let mut dsu = copper_components(&items, plane_layers);
+    let mut dsu = copper_components(&items, plane_layers, &plane_polys(board, plane_layers));
     let mut roots: HashMap<NetId, Vec<usize>> = HashMap::new();
     for (i, it) in items.iter().enumerate() {
         if it.kind == ItemKind::Pad && it.net != 0 {

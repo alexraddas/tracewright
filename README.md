@@ -8,14 +8,24 @@ construction.
 ## Using it
 
 1. In KiCad: **Preferences → Plugins → Enable KiCad API** (must be on).
-2. Install, then restart the PCB Editor:
-   * Windows: `tools\install_plugin.ps1` (copies `dist\tracewright.exe`, the manifest and icons
-     to `Documents\KiCad\10.0\plugins\com.tracewright.router`).
-   * macOS / Linux: `tools/install_plugin.sh` (copies `target/release/tracewright` to
-     `~/Documents/KiCad/10.0/plugins/com.tracewright.router` on macOS, or
-     `~/.local/share/kicad/10.0/plugins/...` on Linux). The binary is unsigned: a copy you
-     downloaded rather than built carries Gatekeeper's quarantine flag, which the script removes
-     (`xattr -d com.apple.quarantine`); otherwise macOS refuses to launch it from KiCad.
+2. Install, then restart the PCB Editor. Pick one:
+   * **From the Tracewright repository (one click, with updates).** In the KiCad project
+     manager, open **Plugin and Content Manager → Manage…**, add
+     `https://github.com/alexraddas/tracewright/releases/latest/download/repository.json`,
+     select the *Tracewright* repository, and install **Tracewright GPU Autorouter**. Updates
+     then appear in the Plugin and Content Manager.
+   * **From a file.** Download `tracewright-<version>-<macos|windows|linux>.zip` from the
+     [latest release](https://github.com/alexraddas/tracewright/releases/latest) and use
+     **Plugin and Content Manager → Install from File…**. The macOS build is universal
+     (Apple Silicon and Intel).
+   * **From source** (development): `cargo build --release`, then
+     `tools/install_plugin.sh` on macOS / Linux or `tools\install_plugin.ps1` on Windows. They
+     copy the binary, manifest and icons to the user plugins folder
+     (`Documents/KiCad/10.0/plugins/com.tracewright.router` on macOS and Windows,
+     `~/.local/share/kicad/10.0/plugins/...` on Linux). On macOS the script also clears
+     Gatekeeper's quarantine flag from a downloaded binary. Remove this copy if you later
+     install through the Plugin and Content Manager: KiCad loads the user-folder copy over the
+     managed one.
 3. Click **Tracewright: Autoroute** in the PCB Editor toolbar. The window shows:
    * **Design rules** per net class (clearance, track width, via size/drill), copper-to-edge,
      hole clearance, hole-to-hole, pre-filled from the board and its `.kicad_pro`.
@@ -23,13 +33,15 @@ construction.
      (inner layers covering most of the board with a zone are detected as planes; their net is
      fanned out to them with vias).
    * **Routing quality**: grid pitch (auto), via cost, bend cost, wrong-way factor, comfort
-     margin, 90° or 45° corners, end tracks at pad centres, via-in-pad.
-   * **Nets**: keep existing tracks and finish the rest, skip / only-route globs.
+     margin, minimum neck-down width, 90° or 45° corners, end tracks at pad centres, via-in-pad.
+   * **Nets**: keep existing tracks and finish the rest, *force re-route* of connections whose
+     existing tracks are narrower than the minimum neck-down (their old copper is deleted in the
+     same undo step), skip / only-route globs.
    * **Engine**: Auto / GPU / CPU, iteration cap, congestion schedule.
 4. **Route** shows the routing converge live; **Apply to KiCad** adds all tracks and vias as one
    undo step and refills zones. Settings are remembered per user.
 
-Headless: `tracewright-cli route board.json --svg out.svg`, `tracewright-cli route-live`
+Headless: `tracewright-cli route board.json --svg out.svg [--min-neck 0.15 --force-reroute]`, `tracewright-cli route-live`
 (route the board open in KiCad), `tracewright-cli dump`, `tracewright-cli gpu-info`.
 
 ## How it works
@@ -47,7 +59,8 @@ Headless: `tracewright-cli route board.json --svg out.svg`, `tracewright-cli rou
   costs make the wgpu (Vulkan/DX12/Metal) backend bit-identical to the multithreaded CPU
   fallback. Target selection and the path trace also run on the GPU, so only paths come back.
 * **Router** (`src/router.rs`). Steiner growth per net with warm-started searches; plane nets
-  fan out in clusters; neck-down to the board's minimum track width only next to pads the class
+  fan out in clusters, with vias only where they land inside the plane's actual copper (zone
+  fill, so no-pour areas are respected); neck-down to the board's minimum track width only next to pads the class
   width cannot reach or enter side by side; PathFinder negotiation (present + history
   congestion, growing windows for stuck nets); a final hard legalisation pass; own-net via
   hole spacing; segments merged, axis-aligned pad-centre stubs, optional 45° mitres — every
@@ -89,14 +102,11 @@ Dev tools (KiCad's Python): `tools/kicad_dump.py` (board → JSON), `tools/kicad
 
 ## Known limitations
 
-* **Toolbar button not confirmed yet.** After installing, the "Tracewright: Autoroute" button
-  did not show in the KiCad 10.0.8 PCB Editor toolbar during testing (`pcbnew.json` →
-  `plugins.actions` stayed empty), so KiCad may not be registering the plugin. Running the
-  installed `tracewright.exe` directly while the PCB Editor is open works (it connects over the
-  default API socket). Probable cause: KiCad 10 skips any action whose `entrypoint` is an
-  absolute path (`common/api/api_plugin.cpp`, "action contains abs path; skipping"), and
-  `install_plugin.ps1` writes an absolute one. `install_plugin.sh` keeps it relative; the Windows
-  script is unchanged until this is confirmed there.
+* **Toolbar button on Windows not confirmed yet.** In early testing the "Tracewright: Autoroute"
+  button did not appear in the KiCad 10.0.8 PCB Editor on Windows. The cause was
+  `install_plugin.ps1` writing an absolute `entrypoint`: KiCad 10 skips such actions
+  (`common/api/api_plugin.cpp`, "action contains abs path; skipping"). The script and the
+  release packages now keep it relative; re-test on Windows.
 * Pads outside the board outline are skipped and reported separately ("pads outside the board
   outline skipped"); they are not counted as routing failures.
 * macOS: the engine, tests and headless CLI are verified on Apple M4 Pro (Metal):
@@ -107,6 +117,33 @@ Dev tools (KiCad's Python): `tools/kicad_dump.py` (board → JSON), `tools/kicad
   faster. Linux builds in CI but is untested on a real GPU.
 * Through vias only in the router (the engine supports blind/buried spans; not exposed yet).
 * Very dense boards with 2 signal layers and fine-pitch parts (RoyalBlue54L) do not converge yet.
+* **Auto pitch** starts from the design rules and refines automatically (down to 0.04 mm,
+  within the node budget) when some pads have no legal grid node, e.g. 0.5 mm-pitch MSOPs.
+* **Force re-route** rips each too-thin track's copper run (same net, stopping at pads) and,
+  if a pad then cannot be reached at the minimum neck-down, the nearby runs of other nets too.
+  A connection that still cannot be completed keeps its existing copper; the final copper is
+  checked for connectivity before anything is reported as routed.
 * Net-class widths are used as given: boards whose classes keep KiCad's stock 0.25 mm / 0.8 mm
   values but were designed with smaller sizes need the sizes set in the dialog.
 * No diff-pair, length matching or custom DRC rule (`.kicad_dru`) support.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, merge to `main`, then tag and push:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` checks that the tag matches `Cargo.toml`, then:
+
+1. builds macOS (universal, ad-hoc signed), Linux x86_64 (Ubuntu 22.04, for older glibc) and
+   Windows x64 (static CRT);
+2. packages each platform with `tools/package_pcm.py`;
+3. publishes a GitHub Release with the plugin zips, the CLI zips, and the PCM repository
+   files (`packages.json`, `repository.json`).
+
+The repository URL above always points at the latest release, so the Plugin and Content
+Manager offers the update. Running the workflow by hand (*workflow_dispatch*) builds and
+packages without publishing; download the `release` artifact to test a package with
+**Install from File…** first.

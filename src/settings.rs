@@ -89,6 +89,12 @@ pub struct Settings {
     pub neck_width: f64,
     /// Board minimum track width (copied from the board rules; used for automatic neck-down).
     pub min_track_width: f64,
+    /// Floor for neck-down width (mm): necks are never narrower than this, even when the
+    /// board allows thinner tracks. 0 = no floor beyond the board minimum.
+    pub min_neck_width: f64,
+    /// With `keep_existing`, rip up and re-route nets whose existing tracks are narrower than
+    /// `min_neck_width`, instead of keeping their thin necks.
+    pub force_reroute: bool,
     /// Route nets with overlapping search windows in the same GPU batch during negotiation
     /// (much higher GPU throughput; the final legalisation pass is always exact).
     pub parallel_nets: bool,
@@ -127,6 +133,8 @@ impl Default for Settings {
             max_nodes_per_layer: 4_000_000,
             neck_width: 0.0,
             min_track_width: 0.0,
+            min_neck_width: 0.0,
+            force_reroute: false,
             parallel_nets: true,
         }
     }
@@ -243,16 +251,35 @@ impl Settings {
     }
 
     /// Neck-down width per net class: the user's value, or automatically the board's minimum
-    /// track width (at least 0.1 mm), never wider than the class width. Necks are only used in
-    /// small regions around pads that need them, so the narrow end is the safe choice.
+    /// track width (at least 0.1 mm), raised to `min_neck_width` and never wider than the class
+    /// width. Necks are only used in small regions around pads that need them, so the narrow
+    /// end is the safe choice.
     pub fn neck_widths(&self, _board: &Board) -> Vec<f64> {
         self.netclasses
             .iter()
             .map(|nc| {
                 let w = if self.neck_width > 0.0 { self.neck_width } else { self.min_track_width.max(0.1) };
+                let w = w.max(self.min_neck_width);
                 ((w * 1e6).round() / 1e6).clamp(0.05, nc.track_width)
             })
             .collect()
+    }
+
+    /// Nets to rip up and re-route under `force_reroute`: those with an existing track narrower
+    /// than `min_neck_width`. Empty unless both options and `keep_existing` are on.
+    pub fn forced_nets(&self, board: &Board) -> Vec<crate::board::NetId> {
+        if !(self.force_reroute && self.keep_existing && self.min_neck_width > 0.0) {
+            return vec![];
+        }
+        let mut nets: Vec<crate::board::NetId> = board
+            .tracks
+            .iter()
+            .filter(|t| t.net != 0 && t.width < self.min_neck_width - 1e-6 && self.net_selected(board.net_name(t.net)))
+            .map(|t| t.net)
+            .collect();
+        nets.sort_unstable();
+        nets.dedup();
+        nets
     }
 
     /// Grid pitch to use for this board.
@@ -379,5 +406,35 @@ mod tests {
         assert!(glob_match("*VCC*", "+3V3_VCC_IO"));
         assert!(!glob_match("VCC", "VCC2"));
         assert!(glob_match("Net-(U?-*)", "Net-(U1-Pad3)"));
+    }
+
+    fn board_with_tracks(widths: &[(u32, f64)]) -> Board {
+        use crate::board::{Net, Track};
+        let mut b = Board::default();
+        b.nets = ["", "A", "B"].iter().map(|n| Net { name: n.to_string(), code: 0, netclass: 0 }).collect();
+        b.tracks = widths.iter().map(|&(net, w)| Track { id: format!("t{net}{w}"), net, layer: 0, a: P2::new(0.0, 0.0), b: P2::new(1.0, 0.0), width: w }).collect();
+        b
+    }
+
+    #[test]
+    fn neck_floor_raises_neck_width() {
+        let b = Board::default();
+        let mut s = Settings { min_track_width: 0.1, ..Settings::default() };
+        assert!((s.neck_widths(&b)[0] - 0.1).abs() < 1e-9);
+        s.min_neck_width = 0.15;
+        assert!((s.neck_widths(&b)[0] - 0.15).abs() < 1e-9);
+        s.min_neck_width = 0.4; // never wider than the class width (0.25)
+        assert!((s.neck_widths(&b)[0] - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forced_nets_need_both_options() {
+        let b = board_with_tracks(&[(1, 0.12), (2, 0.25)]);
+        let mut s = Settings { min_neck_width: 0.15, ..Settings::default() };
+        assert!(s.forced_nets(&b).is_empty(), "force_reroute off");
+        s.force_reroute = true;
+        assert_eq!(s.forced_nets(&b), vec![1]);
+        s.keep_existing = false;
+        assert!(s.forced_nets(&b).is_empty(), "nothing to keep, nothing to force");
     }
 }
