@@ -50,8 +50,9 @@ Headless: `tracewright-cli route board.json --svg out.svg [--min-neck 0.15 --for
   fallback. Target selection and the path trace also run on the GPU, so only paths come back.
 * **Router** (`src/router.rs`). Steiner growth per net with warm-started searches; plane nets
   fan out in clusters, with vias only where they land inside the plane's actual copper (zone
-  fill, so no-pour areas are respected); neck-down to the board's minimum track width only next to pads the class
-  width cannot reach or enter side by side; PathFinder negotiation (present + history
+  fill, so no-pour areas are respected); graduated neck-down only next to pads the class
+  width cannot reach or enter side by side, per pad and only as far as that pad needs
+  (0.05 mm steps from just under the class width down to the minimum neck-down); PathFinder negotiation (present + history
   congestion, growing windows for stuck nets); a final hard legalisation pass; own-net via
   hole spacing; segments merged, axis-aligned pad-centre stubs, optional 45° mitres — every
   off-grid addition validated geometrically.
