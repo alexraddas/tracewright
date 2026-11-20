@@ -41,8 +41,12 @@ fn default_socket() -> String {
     }
     if cfg!(windows) {
         format!("ipc://{}\\kicad\\api.sock", std::env::temp_dir().display().to_string().trim_end_matches('\\'))
-    } else {
+    } else if cfg!(target_os = "macos") {
+        // KiCad uses /tmp on macOS, not $TMPDIR (whose long path would exceed the socket limit).
         "ipc:///tmp/kicad/api.sock".to_string()
+    } else {
+        // Elsewhere KiCad uses wxStandardPaths::GetTempDir(): $TMPDIR, else /tmp.
+        format!("ipc://{}/kicad/api.sock", std::env::temp_dir().display().to_string().trim_end_matches('/'))
     }
 }
 

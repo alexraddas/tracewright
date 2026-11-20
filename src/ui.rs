@@ -673,11 +673,23 @@ impl eframe::App for App {
 /// Add the system UI and symbol fonts as fallbacks so arrows, check marks and other symbols
 /// never render as boxes.
 fn install_fonts(ctx: &egui::Context) {
+    use std::path::PathBuf;
     let mut fonts = egui::FontDefinitions::default();
-    let dir = std::env::var_os("WINDIR").map(|w| std::path::PathBuf::from(w).join("Fonts"));
-    let Some(dir) = dir else { return };
-    for (name, file) in [("segoe_ui", "segoeui.ttf"), ("segoe_symbol", "seguisym.ttf"), ("segoe_emoji", "seguiemj.ttf")] {
-        if let Ok(bytes) = std::fs::read(dir.join(file)) {
+    let files: Vec<(&str, PathBuf)> = if cfg!(windows) {
+        let dir = std::env::var_os("WINDIR").map(|w| PathBuf::from(w).join("Fonts"));
+        let Some(dir) = dir else { return };
+        [("segoe_ui", "segoeui.ttf"), ("segoe_symbol", "seguisym.ttf"), ("segoe_emoji", "seguiemj.ttf")].into_iter().map(|(n, f)| (n, dir.join(f))).collect()
+    } else if cfg!(target_os = "macos") {
+        // Apple Color Emoji is a bitmap (sbix) font egui cannot draw, so symbols come from these.
+        vec![
+            ("apple_symbols", "/System/Library/Fonts/Apple Symbols.ttf".into()),
+            ("arial_unicode", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf".into()),
+        ]
+    } else {
+        vec![("dejavu_sans", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into()), ("noto_symbols", "/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf".into())]
+    };
+    for (name, path) in files {
+        if let Ok(bytes) = std::fs::read(path) {
             fonts.font_data.insert(name.to_owned(), std::sync::Arc::new(egui::FontData::from_owned(bytes)));
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 fonts.families.entry(fam).or_default().push(name.to_owned());

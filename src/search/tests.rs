@@ -170,12 +170,25 @@ fn cpu_matches_dijkstra_and_backtrace_is_optimal() {
     }
 }
 
+/// The GPU backend, or None (test skipped) when there is no usable adapter. CI sets
+/// TRACEWRIGHT_REQUIRE_GPU=1 on runners that have one, so a broken backend fails there.
+fn gpu_backend() -> Option<gpu::GpuBackend> {
+    match gpu::GpuBackend::new() {
+        Ok(g) => {
+            eprintln!("GPU: {}", g.adapter_name());
+            Some(g)
+        }
+        Err(e) if std::env::var_os("TRACEWRIGHT_REQUIRE_GPU").is_some() => panic!("GPU required but unavailable: {e:#}"),
+        Err(e) => {
+            eprintln!("no GPU adapter ({e:#}); skipping");
+            None
+        }
+    }
+}
+
 #[test]
 fn gpu_matches_cpu_bit_for_bit() {
-    let Ok(mut gpu) = gpu::GpuBackend::new() else {
-        eprintln!("no GPU adapter; skipping");
-        return;
-    };
+    let Some(mut gpu) = gpu_backend() else { return };
     let mut r = Rng::new(99);
     for round in 0..12 {
         let jobs: Vec<(SearchJob, Vec<u32>)> = (0..r.range(1, 12)).map(|_| random_job(&mut r)).collect();
@@ -207,10 +220,7 @@ fn gpu_matches_cpu_bit_for_bit() {
 
 #[test]
 fn gpu_pick_and_trace_match_cpu() {
-    let Ok(mut gpu) = gpu::GpuBackend::new() else {
-        eprintln!("no GPU adapter; skipping");
-        return;
-    };
+    let Some(mut gpu) = gpu_backend() else { return };
     let mut r = Rng::new(4242);
     for round in 0..20 {
         let jobs: Vec<(SearchJob, Vec<u32>)> = (0..r.range(1, 10)).map(|_| random_job(&mut r)).collect();
@@ -231,7 +241,7 @@ fn warm_start_with_added_seeds() {
     let mut r = Rng::new(3);
     let backends: Vec<Box<dyn Backend>> = {
         let mut v: Vec<Box<dyn Backend>> = vec![Box::new(cpu::CpuBackend::new())];
-        if let Ok(g) = gpu::GpuBackend::new() {
+        if let Some(g) = gpu_backend() {
             v.push(Box::new(g));
         }
         v

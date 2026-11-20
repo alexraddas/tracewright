@@ -2,6 +2,7 @@
 name = "tracewright"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 description = "GPU-accelerated orthogonal PCB autorouter plugin for KiCad"
 license = "MIT"
 
