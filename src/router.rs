@@ -152,10 +152,10 @@ struct Task {
     class: usize,
     tp: usize,
     vp: usize,
-    /// Neck-down probe and the (sorted) nodes where it may be used.
-    tn: usize,
+    /// Nodes (sorted) where the net may neck down, and the rung (index into the class's neck
+    /// ladder) for each: the widest that reaches the pad the node belongs to.
     neck: Vec<u32>,
-    neck_w: f64,
+    neck_rung: Vec<u8>,
     /// Via sites this net may not use (sorted plane indices), learned from hole-spacing
     /// conflicts between its own vias.
     forbid_vias: Vec<u32>,
@@ -189,7 +189,8 @@ pub struct Router<'a> {
     /// Disk offsets: [class][probe] for track nodes and via nodes.
     trace_disk: Vec<Vec<Arc<Vec<(i32, i32)>>>>,
     via_disk: Vec<Vec<Arc<Vec<(i32, i32)>>>>,
-    neck_disk: Vec<Vec<Arc<Vec<(i32, i32)>>>>,
+    /// Per class, per neck rung, per probe.
+    neck_disk: Vec<Vec<Vec<Arc<Vec<(i32, i32)>>>>>,
     max_reach: usize,
     /// Pads outside the board outline (skipped).
     offboard_pads: Vec<usize>,
@@ -230,10 +231,9 @@ impl<'a> Router<'a> {
         let mut via_disk = Vec::new();
         let mut neck_disk = Vec::new();
         for (ci, nc) in settings.netclasses.iter().enumerate() {
-            let neck_w = maps.neck_w[ci];
             let mut td = Vec::new();
             let mut vd = Vec::new();
-            let mut nd = Vec::new();
+            let mut nd: Vec<Vec<Arc<Vec<(i32, i32)>>>> = vec![Vec::new(); maps.neck_ladder[ci].len().max(1)];
             for p in &maps.probes {
                 // Routed copper sits exactly on (whole-nm) grid nodes, so no safety margin:
                 // nodes at exactly the clearance distance are legal, as in KiCad's DRC.
@@ -243,7 +243,10 @@ impl<'a> Router<'a> {
                 max_reach = max_reach.max((rt.max(rv) / pitch).ceil() as usize + 1);
                 td.push(get(rt));
                 vd.push(get(rv));
-                nd.push(get(neck_w / 2.0 + nc.clearance.max(p.clearance) + p.half));
+                for (ri, rung) in nd.iter_mut().enumerate() {
+                    let w = maps.neck_ladder[ci].get(ri).map(|r| r.1).unwrap_or(maps.neck_w[ci]);
+                    rung.push(get(w / 2.0 + nc.clearance.max(p.clearance) + p.half));
+                }
             }
             trace_disk.push(td);
             via_disk.push(vd);
@@ -315,8 +318,8 @@ impl<'a> Router<'a> {
             let mut groups = Vec::new();
             let mut unreachable = 0usize;
             let mut offboard = 0usize;
-            let mut neck: Vec<u32> = Vec::new();
-            let neck_w = self.maps.neck_w[class];
+            let mut neck: Vec<(u32, u8)> = Vec::new();
+            let ladder = self.maps.neck_ladder[class].clone();
             for root in roots {
                 if plane.is_some() && plane_root.get(&net).is_some_and(|&pr| dsu.find(pr) == root) {
                     continue; // already on the plane
@@ -340,14 +343,23 @@ impl<'a> Router<'a> {
                                     node_pad.push(pad);
                                 }
                             }
-                            if cp.neck != cp.trace && (nodes.len() == before || tight.contains(&(pad, layer))) {
+                            if !ladder.is_empty() && (nodes.len() == before || tight.contains(&(pad, layer))) {
                                 // The class width cannot reach this pad, or cannot enter it
-                                // next to a neighbouring pad's track: neck down next to it.
-                                let found: Vec<u32> = pad_terminal_nodes(board, &self.maps, pad, cp.neck).into_iter().filter(|&e| e as usize / g.plane() == layer).map(|e| e as u32).collect();
+                                // next to a neighbouring pad's track: neck down next to it, only
+                                // as far as needed (widest rung that reaches it).
+                                let mut found: Vec<u32> = Vec::new();
+                                let mut rung = 0u8;
+                                for (ri, &(probe, _)) in ladder.iter().enumerate() {
+                                    found = pad_terminal_nodes(board, &self.maps, pad, probe).into_iter().filter(|&e| e as usize / g.plane() == layer).map(|e| e as u32).collect();
+                                    if !found.is_empty() {
+                                        rung = ri as u8;
+                                        break;
+                                    }
+                                }
                                 if !found.is_empty() {
                                     nodes.truncate(before);
                                     node_pad.truncate(before);
-                                    neck.extend(self.neck_region(pad));
+                                    neck.extend(self.neck_region(pad).into_iter().map(|e| (e, rung)));
                                     for e in found {
                                         nodes.push(e);
                                         node_pad.push(pad);
@@ -429,16 +441,25 @@ impl<'a> Router<'a> {
             }
             let hpwl = if groups.is_empty() { 0.0 } else { ((x1 - x0) + (y1 - y0)) as f64 * g.pitch };
             self.stats.connections_total += needed + unreachable + offboard;
+            // Where two pads' neck regions overlap, the narrower rung applies.
             neck.sort_unstable();
-            neck.dedup();
+            let mut neck_nodes: Vec<u32> = Vec::with_capacity(neck.len());
+            let mut neck_rung: Vec<u8> = Vec::with_capacity(neck.len());
+            for (e, r) in neck {
+                if neck_nodes.last() == Some(&e) {
+                    *neck_rung.last_mut().unwrap() = r;
+                } else {
+                    neck_nodes.push(e);
+                    neck_rung.push(r);
+                }
+            }
             self.tasks.push(Task {
                 net,
                 class,
                 tp: cp.trace,
                 vp: cp.via,
-                tn: cp.neck,
-                neck,
-                neck_w,
+                neck: neck_nodes,
+                neck_rung,
                 forbid_vias: Vec::new(),
                 via_retries: 0,
                 groups,
@@ -584,18 +605,20 @@ impl<'a> Router<'a> {
         let owner = &self.maps.owner[tp];
         let comfort = &self.maps.comfort[tp];
         let count = &self.occ.count[tp];
-        let (nowner, ncount) = (&self.maps.owner[t.tn], &self.occ.count[t.tn]);
-        // Neck-down nodes inside this window.
-        let mut neck_here = vec![false; nl * plane];
-        for &e in &t.neck {
+        // Owner and occupancy maps per neck rung.
+        let nmaps: Vec<(&Vec<u16>, &Vec<u16>)> = self.maps.neck_ladder[t.class].iter().map(|&(p, _)| (&self.maps.owner[p], &self.occ.count[p])).collect();
+        // Neck-down nodes inside this window: their rung + 1 (0 = not a neck node).
+        let mut neck_here = vec![0u8; nl * plane];
+        for (&e, &r) in t.neck.iter().zip(&t.neck_rung) {
             let e = e as usize;
             let (l, p) = (e / g.plane(), e % g.plane());
             let (y, x) = (p / g.nx, p % g.nx);
             if x >= win.x0 && y >= win.y0 && x < win.x0 + w && y < win.y0 + h {
-                neck_here[l * plane + (y - win.y0) * w + (x - win.x0)] = true;
+                neck_here[l * plane + (y - win.y0) * w + (x - win.x0)] = r + 1;
             }
         }
         let neck_here = &neck_here;
+        let nmaps = &nmaps;
         let hist = &self.occ.hist;
         let routable = &self.maps.routable;
         let mut cell = vec![INF; nl * plane];
@@ -607,12 +630,18 @@ impl<'a> Router<'a> {
             }
             for (lx, o) in out.iter_mut().enumerate() {
                 let gi = g.idx(l, y, win.x0 + lx);
-                let is_neck = neck_here[row * w + lx];
-                let ow = if is_neck { nowner[gi] } else { owner[gi] };
+                let r = neck_here[row * w + lx];
+                let is_neck = r > 0;
+                let (ow, occ) = if is_neck {
+                    let (no, nc) = nmaps[r as usize - 1];
+                    (no[gi], nc[gi])
+                } else {
+                    (owner[gi], count[gi])
+                };
                 if !(ow == FREE || ow as u32 == net) {
                     continue;
                 }
-                let occ = if is_neck { ncount[gi] } else { count[gi] } as f64;
+                let occ = occ as f64;
                 if hard && occ > 0.0 {
                     continue;
                 }
@@ -712,8 +741,9 @@ impl<'a> Router<'a> {
             let epoch = self.occ.epoch;
             let td = self.trace_disk[class][k].clone();
             let vd = self.via_disk[class][k].clone();
-            let nd = self.neck_disk[class][k].clone();
+            let nds: Vec<Arc<Vec<(i32, i32)>>> = self.neck_disk[class].iter().map(|r| r[k].clone()).collect();
             let neck = std::mem::take(&mut self.tasks[ti].neck);
+            let neck_rung = std::mem::take(&mut self.tasks[ti].neck_rung);
             let Occ { count, marks, .. } = &mut self.occ;
             let cnt = &mut count[k];
             let mut apply = |l: usize, y: i32, x: i32, d: &[(i32, i32)]| {
@@ -730,7 +760,10 @@ impl<'a> Router<'a> {
                 }
             };
             for &e in &route.nodes {
-                let d: &[(i32, i32)] = if neck.binary_search(&e).is_ok() { &nd } else { &td };
+                let d: &[(i32, i32)] = match neck.binary_search(&e) {
+                    Ok(i) => &nds[neck_rung[i] as usize],
+                    Err(_) => &td,
+                };
                 let e = e as usize;
                 let (l, p) = (e / plane, e % plane);
                 apply(l, (p / g.nx) as i32, (p % g.nx) as i32, d);
@@ -742,6 +775,7 @@ impl<'a> Router<'a> {
                 }
             }
             self.tasks[ti].neck = neck;
+            self.tasks[ti].neck_rung = neck_rung;
         }
         self.tasks[ti].route = route;
         self.tasks[ti].committed = sign > 0;
@@ -755,10 +789,24 @@ impl<'a> Router<'a> {
         t.route = NetRoute::default();
     }
 
+    /// Trace probe that governs node `e` of task `t`: its neck rung's probe inside a neck region,
+    /// otherwise the class trace probe.
+    fn node_probe(&self, t: &Task, e: u32) -> usize {
+        match t.neck.binary_search(&e) {
+            Ok(i) => self.maps.neck_ladder[t.class][t.neck_rung[i] as usize].0,
+            Err(_) => t.tp,
+        }
+    }
+
+    /// Neck-down width at node `e` of task `t`, if it lies in a neck region.
+    fn node_neck_w(&self, t: &Task, e: u32) -> Option<f64> {
+        t.neck.binary_search(&e).ok().map(|i| self.maps.neck_ladder[t.class][t.neck_rung[i] as usize].1)
+    }
+
     fn conflicted(&self, ti: usize) -> bool {
         let t = &self.tasks[ti];
         let plane = self.maps.grid.plane();
-        t.route.nodes.iter().any(|&e| self.occ.count[if t.neck.binary_search(&e).is_ok() { t.tn } else { t.tp }][e as usize] >= 2)
+        t.route.nodes.iter().any(|&e| self.occ.count[self.node_probe(t, e)][e as usize] >= 2)
             || t.route.vias.iter().any(|&p| (0..self.maps.grid.nl).any(|l| self.occ.count[t.vp][l * plane + p as usize] >= 2))
     }
 
@@ -768,7 +816,7 @@ impl<'a> Router<'a> {
         let t = &self.tasks[ti];
         let mut bump: Vec<usize> = Vec::new();
         for &e in &t.route.nodes {
-            let k = if t.neck.binary_search(&e).is_ok() { t.tn } else { t.tp };
+            let k = self.node_probe(t, e);
             if self.occ.count[k][e as usize] >= 2 {
                 bump.push(e as usize);
             }
@@ -1095,7 +1143,7 @@ impl<'a> Router<'a> {
                 .nodes
                 .iter()
                 .copied()
-                .filter(|&e| self.occ.count[if t.neck.binary_search(&e).is_ok() { t.tn } else { t.tp }][e as usize] >= 2)
+                .filter(|&e| self.occ.count[self.node_probe(t, e)][e as usize] >= 2)
                 .collect();
             let bad_vias: Vec<u32> = t.route.vias.iter().copied().filter(|&p| (0..g.nl).any(|l| self.occ.count[t.vp][l * plane + p as usize] >= 2)).collect();
             let Some(&e) = bad.first() else {
@@ -1243,14 +1291,19 @@ impl<'a> Router<'a> {
             }
         }
         let dir = |a: u32, b: u32| -> i64 { b as i64 - a as i64 };
-        let in_neck = |n: u32| t.neck.binary_search(&n).is_ok();
-        let narrow = |a: u32, b: u32| in_neck(a) || in_neck(b);
+        // A segment touching a neck node takes the narrower neck width of its two ends.
+        let narrow_w = |a: u32, b: u32| -> Option<f64> {
+            match (self.node_neck_w(t, a), self.node_neck_w(t, b)) {
+                (None, None) => None,
+                (x, y) => Some(x.unwrap_or(f64::MAX).min(y.unwrap_or(f64::MAX))),
+            }
+        };
         let is_break = |n: u32| -> bool {
             let Some(nb) = adj.get(&n) else { return true };
             if nb.len() != 2 || via_set.contains(&(n % plane)) || ends.contains(&n) {
                 return true;
             }
-            dir(nb[0], n) != dir(n, nb[1]) || narrow(nb[0], n) != narrow(n, nb[1])
+            dir(nb[0], n) != dir(n, nb[1]) || narrow_w(nb[0], n) != narrow_w(n, nb[1])
         };
         let mut segs = Vec::new();
         let mut used: HashSet<(u32, u32)> = HashSet::new();
@@ -1286,7 +1339,7 @@ impl<'a> Router<'a> {
                     layer: la / g.plane(),
                     a: g.pos(pa % g.nx, pa / g.nx),
                     b: g.pos(pb % g.nx, pb / g.nx),
-                    width: if narrow(start, nb) { t.neck_w } else { width },
+                    width: narrow_w(start, nb).unwrap_or(width),
                 });
             }
         }
@@ -1346,7 +1399,7 @@ impl<'a> Router<'a> {
                         if inside && !aligned {
                             continue;
                         }
-                        let sw = if t.neck.binary_search(&e).is_ok() { t.neck_w } else { nc.track_width };
+                        let sw = self.node_neck_w(t, e).unwrap_or(nc.track_width);
                         if segment_clear(&index, s, t.net, layer, q, target, sw / 2.0, nc.clearance) {
                             stubs.push(Seg { net: t.net, layer, a: q, b: target, width: sw });
                         } else if !inside {

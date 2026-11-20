@@ -265,6 +265,30 @@ impl Settings {
             .collect()
     }
 
+    /// Neck-down widths per net class, widest first: 0.05 mm steps below the class width down to
+    /// the class's neck width (`neck_widths`). Each connection uses the widest one that reaches
+    /// all of its pads, so a pad that takes 0.2 mm is not necked to 0.1 mm. Empty when the neck
+    /// width is the class width (no neck-down).
+    pub fn neck_ladders(&self, board: &Board) -> Vec<Vec<f64>> {
+        let floor = self.neck_widths(board);
+        self.netclasses
+            .iter()
+            .enumerate()
+            .map(|(ci, nc)| {
+                let mut v = Vec::new();
+                let mut w = ((nc.track_width - 1e-9) / 0.05).floor() * 0.05;
+                while w > floor[ci] + 1e-9 {
+                    v.push((w * 1e6).round() / 1e6);
+                    w -= 0.05;
+                }
+                if floor[ci] < nc.track_width - 1e-9 {
+                    v.push(floor[ci]);
+                }
+                v
+            })
+            .collect()
+    }
+
     /// Nets to rip up and re-route under `force_reroute`: those with an existing track narrower
     /// than `min_neck_width`. Empty unless both options and `keep_existing` are on.
     pub fn forced_nets(&self, board: &Board) -> Vec<crate::board::NetId> {
@@ -414,6 +438,17 @@ mod tests {
         b.nets = ["", "A", "B"].iter().map(|n| Net { name: n.to_string(), code: 0, netclass: 0 }).collect();
         b.tracks = widths.iter().map(|&(net, w)| Track { id: format!("t{net}{w}"), net, layer: 0, a: P2::new(0.0, 0.0), b: P2::new(1.0, 0.0), width: w }).collect();
         b
+    }
+
+    #[test]
+    fn neck_ladder_steps_down_to_the_floor() {
+        let b = Board::default();
+        let mut s = Settings::default();
+        assert_eq!(s.neck_ladders(&b)[0], vec![0.2, 0.15, 0.1]);
+        s.min_neck_width = 0.2;
+        assert_eq!(s.neck_ladders(&b)[0], vec![0.2]);
+        s.min_neck_width = 0.25; // the class width: no neck-down at all
+        assert!(s.neck_ladders(&b)[0].is_empty());
     }
 
     #[test]
