@@ -114,14 +114,21 @@ def main():
                                "a": pt(t.GetStart()), "b": pt(t.GetEnd()), "width": t.GetWidth() * NM})
 
     keepouts, zones = [], []
-    for z in b.Zones():
+    # Fill first so plane zones are exported as the copper that actually exists
+    # (no-pour rule areas, clearances and islands removed), not their outline.
+    pcbnew.ZONE_FILLER(b).Fill(b.Zones())
+    all_zones = list(b.Zones()) + [z for f in b.GetFootprints() for z in f.Zones()]   # footprint keepouts too
+    for z in all_zones:
         layers = [lidx[l] for l in z.GetLayerSet().CuStack() if l in lidx]
-        for p in polys(z.Outline()):
-            if z.GetIsRuleArea():
-                if z.GetDoNotAllowTracks() or z.GetDoNotAllowVias():
+        if z.GetIsRuleArea():
+            if z.GetDoNotAllowTracks() or z.GetDoNotAllowVias():
+                for p in polys(z.Outline()):
                     keepouts.append({"layers": layers, "poly": p, "no_tracks": bool(z.GetDoNotAllowTracks()), "no_vias": bool(z.GetDoNotAllowVias())})
-            elif z.GetNetCode() > 0:
-                zones.append({"net": net_index.get(z.GetNetCode(), 0), "layers": layers, "poly": p, "name": z.GetZoneName()})
+        elif z.GetNetCode() > 0:
+            for l in z.GetLayerSet().CuStack():
+                if l not in lidx: continue
+                for p in polys(z.GetFilledPolysList(l)):
+                    zones.append({"net": net_index.get(z.GetNetCode(), 0), "layers": [lidx[l]], "poly": p, "name": z.GetZoneName()})
 
     # Copper text and graphics (board-level and inside footprints) as polygons.
     obstacles = []

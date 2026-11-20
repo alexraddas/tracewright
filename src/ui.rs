@@ -253,6 +253,8 @@ impl App {
                     let _ = txp.send(Msg::Progress(p));
                     ep.request_repaint();
                 })?;
+                // Check against the board as routed (force re-route drops the old copper of re-routed nets).
+                let board = crate::router::board_after(&board, &res);
                 let viol = crate::drc::check_clearance(&board, &settings, &res.segs, &res.vias, 1e-6).len();
                 let planes: Vec<(usize, u32)> = settings
                     .layers
@@ -404,6 +406,10 @@ impl App {
                     ui.label("Comfort margin").on_hover_text("Extra spacing from pads that tracks prefer when there is room.");
                     mm(ui, &mut s.comfort_margin, 0.0..=2.0);
                     ui.end_row();
+                    ui.label("Minimum neck-down")
+                        .on_hover_text("Tracks never neck down narrower than this next to fine-pitch pads, even if the board minimum allows it. 0 = board minimum.");
+                    mm(ui, &mut s.min_neck_width, 0.0..=1.0);
+                    ui.end_row();
                     ui.label("Corners");
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut s.corner_style, CornerStyle::Square, "90°");
@@ -419,6 +425,9 @@ impl App {
             });
             egui::CollapsingHeader::new(RichText::new("Nets").strong()).default_open(false).show(ui, |ui| {
                 ui.checkbox(&mut s.keep_existing, "Keep existing tracks and complete the rest");
+                ui.add_enabled(s.keep_existing && s.min_neck_width > 0.0, egui::Checkbox::new(&mut s.force_reroute, "Force re-route nets with tracks below the minimum neck-down"))
+                    .on_hover_text("Rips up the existing tracks and vias of every net that has a track narrower than the minimum neck-down, and routes those nets again. Applying deletes their old copper in the same undo step.")
+                    .on_disabled_hover_text("Needs \"Keep existing tracks\" and a minimum neck-down above 0.");
                 ui.label("Skip nets (globs, comma separated)");
                 ui.text_edit_singleline(&mut self.skip_text);
                 ui.label("Only route nets (empty = all)");

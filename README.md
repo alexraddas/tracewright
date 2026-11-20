@@ -23,13 +23,15 @@ construction.
      (inner layers covering most of the board with a zone are detected as planes; their net is
      fanned out to them with vias).
    * **Routing quality**: grid pitch (auto), via cost, bend cost, wrong-way factor, comfort
-     margin, 90° or 45° corners, end tracks at pad centres, via-in-pad.
-   * **Nets**: keep existing tracks and finish the rest, skip / only-route globs.
+     margin, minimum neck-down width, 90° or 45° corners, end tracks at pad centres, via-in-pad.
+   * **Nets**: keep existing tracks and finish the rest, *force re-route* of connections whose
+     existing tracks are narrower than the minimum neck-down (their old copper is deleted in the
+     same undo step), skip / only-route globs.
    * **Engine**: Auto / GPU / CPU, iteration cap, congestion schedule.
 4. **Route** shows the routing converge live; **Apply to KiCad** adds all tracks and vias as one
    undo step and refills zones. Settings are remembered per user.
 
-Headless: `tracewright-cli route board.json --svg out.svg`, `tracewright-cli route-live`
+Headless: `tracewright-cli route board.json --svg out.svg [--min-neck 0.15 --force-reroute]`, `tracewright-cli route-live`
 (route the board open in KiCad), `tracewright-cli dump`, `tracewright-cli gpu-info`.
 
 ## How it works
@@ -47,7 +49,8 @@ Headless: `tracewright-cli route board.json --svg out.svg`, `tracewright-cli rou
   costs make the wgpu (Vulkan/DX12/Metal) backend bit-identical to the multithreaded CPU
   fallback. Target selection and the path trace also run on the GPU, so only paths come back.
 * **Router** (`src/router.rs`). Steiner growth per net with warm-started searches; plane nets
-  fan out in clusters; neck-down to the board's minimum track width only next to pads the class
+  fan out in clusters, with vias only where they land inside the plane's actual copper (zone
+  fill, so no-pour areas are respected); neck-down to the board's minimum track width only next to pads the class
   width cannot reach or enter side by side; PathFinder negotiation (present + history
   congestion, growing windows for stuck nets); a final hard legalisation pass; own-net via
   hole spacing; segments merged, axis-aligned pad-centre stubs, optional 45° mitres — every
@@ -107,6 +110,12 @@ Dev tools (KiCad's Python): `tools/kicad_dump.py` (board → JSON), `tools/kicad
   faster. Linux builds in CI but is untested on a real GPU.
 * Through vias only in the router (the engine supports blind/buried spans; not exposed yet).
 * Very dense boards with 2 signal layers and fine-pitch parts (RoyalBlue54L) do not converge yet.
+* **Auto pitch** starts from the design rules and refines automatically (down to 0.04 mm,
+  within the node budget) when some pads have no legal grid node, e.g. 0.5 mm-pitch MSOPs.
+* **Force re-route** rips each too-thin track's copper run (same net, stopping at pads) and,
+  if a pad then cannot be reached at the minimum neck-down, the nearby runs of other nets too.
+  A connection that still cannot be completed keeps its existing copper; the final copper is
+  checked for connectivity before anything is reported as routed.
 * Net-class widths are used as given: boards whose classes keep KiCad's stock 0.25 mm / 0.8 mm
   values but were designed with smaller sizes need the sizes set in the dialog.
 * No diff-pair, length matching or custom DRC rule (`.kicad_dru`) support.

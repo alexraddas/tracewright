@@ -466,26 +466,57 @@ impl Kicad {
             }
         }
 
-        // Zones: copper pours (plane detection) and rule areas (keepouts).
+        // Zones: copper pours (plane detection) and rule areas (keepouts), on the board and
+        // inside footprints (e.g. a connector's no-track area).
+        let mut kzones: Vec<bt::Zone> = Vec::new();
+        for any in self.get_items(&doc, &[ct::KiCadObjectType::KotPcbZone])? {
+            if let Ok(z) = bt::Zone::decode(any.value.as_slice()) {
+                kzones.push(z);
+            }
+        }
+        for any in self.get_items(&doc, &[ct::KiCadObjectType::KotPcbFootprint])? {
+            let Ok(fp) = bt::FootprintInstance::decode(any.value.as_slice()) else { continue };
+            for item in fp.definition.map(|d| d.items).unwrap_or_default() {
+                if item.type_url.ends_with(".Zone") {
+                    if let Ok(z) = bt::Zone::decode(item.value.as_slice()) {
+                        kzones.push(z);
+                    }
+                }
+            }
+        }
         let mut zones = Vec::new();
         let mut keepouts = Vec::new();
-        for any in self.get_items(&doc, &[ct::KiCadObjectType::KotPcbZone])? {
-            let Ok(z) = bt::Zone::decode(any.value.as_slice()) else { continue };
+        for z in kzones {
             let layers: Vec<usize> = z.layers.iter().filter_map(|l| lidx.get(l).copied()).collect();
-            let polys: Vec<Polygon> = z.outline.as_ref().map(|o| o.polygons.iter().map(polygon).collect()).unwrap_or_default();
+            let outline: Vec<Polygon> = z.outline.as_ref().map(|o| o.polygons.iter().map(polygon).collect()).unwrap_or_default();
             match z.settings {
                 Some(bt::zone::Settings::RuleAreaSettings(r)) => {
                     let (nt, nv) = (r.keepout_tracks || r.keepout_copper, r.keepout_vias || r.keepout_copper);
                     if nt || nv {
-                        for p in polys {
+                        for p in outline {
                             keepouts.push(Keepout { layers: layers.clone(), poly: p, no_tracks: nt, no_vias: nv });
                         }
                     }
                 }
                 Some(bt::zone::Settings::CopperSettings(c)) => {
                     let net = net_of(&c.net);
-                    if net != 0 {
-                        for p in polys {
+                    if net == 0 {
+                        continue;
+                    }
+                    // The copper that actually exists (no-pour areas and clearances removed);
+                    // the outline only when the zone has not been filled.
+                    let filled: Vec<(usize, Polygon)> = z
+                        .filled_polygons
+                        .iter()
+                        .filter_map(|f| lidx.get(&f.layer).map(|&l| (l, f)))
+                        .flat_map(|(l, f)| f.shapes.as_ref().map(|ps| ps.polygons.iter().map(polygon).map(move |p| (l, p)).collect::<Vec<_>>()).unwrap_or_default())
+                        .collect();
+                    if z.filled && !filled.is_empty() {
+                        for (l, p) in filled {
+                            zones.push(Zone { net, layers: vec![l], poly: p, name: z.name.clone() });
+                        }
+                    } else {
+                        for p in outline {
                             zones.push(Zone { net, layers: layers.clone(), poly: p, name: z.name.clone() });
                         }
                     }
@@ -575,6 +606,13 @@ impl Kicad {
         }
         let commit: ccmd::BeginCommitResponse = self.send(&ccmd::BeginCommit {})?;
         let result = (|| -> Result<()> {
+            // Force re-route: the old copper of re-routed nets goes in the same undo step.
+            for chunk in res.removed_ids.chunks(500) {
+                let _: ccmd::DeleteItemsResponse = self.send(&ccmd::DeleteItems {
+                    header: Some(ct::ItemHeader { document: Some(ctx.doc.clone()), container: None, field_mask: None }),
+                    item_ids: chunk.iter().map(|id| ct::Kiid { value: id.clone() }).collect(),
+                })?;
+            }
             for chunk in items.chunks(500) {
                 let r: ccmd::CreateItemsResponse = self.send(&ccmd::CreateItems {
                     header: Some(ct::ItemHeader { document: Some(ctx.doc.clone()), container: None, field_mask: None }),

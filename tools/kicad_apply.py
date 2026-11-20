@@ -4,6 +4,7 @@
 
 `board.json` is the dump the route was made from (for net codes and layer order).
 --strip removes existing tracks/vias first (use when the dump was made with --strip).
+Without it, existing items listed in the result's `removed_ids` (force re-route) are removed.
 """
 import json
 import sys
@@ -22,6 +23,14 @@ def main():
     if strip:
         for t in list(b.GetTracks()):
             b.Remove(t)
+    else:
+        # Force re-route: drop the old copper of re-routed nets before adding the new routes.
+        gone = set(res.get("removed_ids", []))
+        if gone:
+            dead = [t for t in b.GetTracks() if t.m_Uuid.AsString() in gone]
+            for t in dead:
+                b.Remove(t)
+            print("removed %d existing tracks/vias of %d re-routed net(s)" % (len(dead), len(res.get("rerouted_nets", []))))
     mm = lambda v: int(round(v * 1e6))
     vec = lambda p: pcbnew.VECTOR2I(mm(p["x"]), mm(p["y"]))
     for s in res["segs"]:

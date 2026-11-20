@@ -12,7 +12,7 @@
 //!   blocking so the output is always DRC-clean.
 
 use crate::board::{Board, NetId};
-use crate::drc::{Index, Item, ItemKind, Seg, ViaOut, collect_items, copper_components};
+use crate::drc::{Index, Item, ItemKind, Seg, ViaOut, collect_items, copper_components, plane_polys};
 use crate::geom::{P2, Shape};
 use crate::grid::{FREE, SAFETY, StaticMaps, pad_terminal_nodes};
 use crate::search::{Backend, INF, MAX_CELL_COST, SearchJob};
@@ -77,6 +77,12 @@ pub struct RouteResult {
     /// Nets left incomplete only because of off-board pads.
     #[serde(default)]
     pub offboard_nets: Vec<String>,
+    /// Nets whose existing copper was ripped up and re-routed (`force_reroute`).
+    #[serde(default)]
+    pub rerouted_nets: Vec<String>,
+    /// KiCad ids of the existing tracks/vias of `rerouted_nets`, to delete when applying.
+    #[serde(default)]
+    pub removed_ids: Vec<String>,
     pub log: Vec<String>,
 }
 
@@ -187,6 +193,8 @@ pub struct Router<'a> {
     max_reach: usize,
     /// Pads outside the board outline (skipped).
     offboard_pads: Vec<usize>,
+    /// On-board pads without any legal grid node.
+    unreachable_pads: Vec<usize>,
     /// Default search-window margin in cells.
     base_margin: usize,
     pub stats: Stats,
@@ -244,7 +252,7 @@ impl<'a> Router<'a> {
         let occ = Occ { count: (0..nprobe).map(|_| vec![0u16; n]).collect(), hist: vec![0.0; n], marks: vec![0; n], epoch: 0 };
         let stats = Stats { pitch, grid: (g.nx, g.ny, g.nl), ..Default::default() };
         let base_margin = ((settings.window_margin / pitch).ceil() as usize).max(4);
-        let mut r = Router { board, settings, maps, tasks: vec![], occ, trace_disk, via_disk, neck_disk, max_reach, offboard_pads: vec![], base_margin, stats, log: vec![] };
+        let mut r = Router { board, settings, maps, tasks: vec![], occ, trace_disk, via_disk, neck_disk, max_reach, offboard_pads: vec![], unreachable_pads: vec![], base_margin, stats, log: vec![] };
         r.log.push(format!(
             "grid {}x{}x{} at {:.4} mm, {} probe classes, rasterised in {:.2}s",
             r.maps.grid.nx,
@@ -266,7 +274,7 @@ impl<'a> Router<'a> {
         let nl = g.nl;
         let plane_layers: Vec<(usize, NetId)> = self.maps.plane_net.iter().enumerate().filter_map(|(l, n)| n.map(|n| (l, n))).collect();
         let items = collect_items(board, settings, &[], &[], settings.keep_existing);
-        let mut dsu = copper_components(&items, &plane_layers);
+        let mut dsu = copper_components(&items, &plane_layers, &plane_polys(board, &plane_layers));
         // Pads with several layer shapes are one item set.
         let mut first: HashMap<usize, usize> = HashMap::new();
         for (i, it) in items.iter().enumerate() {
@@ -390,6 +398,7 @@ impl<'a> Router<'a> {
                     }
                     if !on.is_empty() {
                         self.log.push(format!("net {name}: no legal grid node at pad(s) {} (blocked by clearance; try a finer grid)", names(&on)));
+                        self.unreachable_pads.extend(on.iter().copied());
                     }
                     continue;
                 }
@@ -403,6 +412,12 @@ impl<'a> Router<'a> {
             }
             let needed = if plane.is_some() { groups.len() } else { groups.len().saturating_sub(1) };
             if needed == 0 && unreachable == 0 && offboard == 0 {
+                continue;
+            }
+            if plane.is_none() && groups.len() + unreachable + offboard <= 1 {
+                // A single pad group (e.g. a no-connect pin's own net): nothing to connect.
+                self.log.retain(|m| !m.starts_with(&format!("net {name}: ")));
+                self.unreachable_pads.retain(|&p| board.pads[p].net != net);
                 continue;
             }
             let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
@@ -838,8 +853,16 @@ impl<'a> Router<'a> {
             let seeds: Vec<u32> = match spec.root {
                 Root::Group(gi) => self.tasks[ti].groups[gi].nodes.iter().filter_map(|&e| self.to_local(&spec.win, e)).collect(),
                 Root::Plane(pl) => {
+                    // Only where a via actually lands on the plane's copper.
                     let pw = spec.win.w * spec.win.h;
-                    (0..pw as u32).map(|p| (pl * pw) as u32 + p).collect()
+                    let g = &self.maps.grid;
+                    (0..pw)
+                        .filter(|&p| {
+                            let (y, x) = (spec.win.y0 + p / spec.win.w, spec.win.x0 + p % spec.win.w);
+                            self.maps.on_plane(pl, y * g.nx + x)
+                        })
+                        .map(|p| (pl * pw + p) as u32)
+                        .collect()
                 }
             };
             jobs.push(job.clone());
@@ -1351,7 +1374,7 @@ impl<'a> Router<'a> {
         pads.sort_unstable();
         pads.dedup();
         let offboard_pads = pads.iter().map(|&p| self.board.pads[p].name.clone()).collect();
-        RouteResult { segs, vias, stats: self.stats.clone(), incomplete_nets, offboard_pads, offboard_nets, log: self.log.clone() }
+        RouteResult { segs, vias, stats: self.stats.clone(), incomplete_nets, offboard_pads, offboard_nets, rerouted_nets: vec![], removed_ids: vec![], log: self.log.clone() }
     }
 }
 
@@ -1482,9 +1505,230 @@ fn miter_corners(mut segs: Vec<Seg>, vias: &[ViaOut], index: &Index, s: &Setting
     segs
 }
 
+/// The board as the router sees it: under `force_reroute`, each existing track narrower than
+/// `min_neck_width` is removed together with the copper run it belongs to (tracks and vias of the
+/// same net joined end to end or through vias, stopping at pads), so that connection is routed
+/// again. The rest of the net is kept. Returns the board, the affected net names and the KiCad ids
+/// of the removed items.
+pub fn prepare_board(board: &Board, settings: &Settings) -> (Board, Vec<String>, Vec<String>) {
+    prepare_board_with(board, settings, &[], &[])
+}
+
+/// `prepare_board`, also ripping the runs of any net with copper within `r` of the given points
+/// (pads a forced net could not reach), and keeping the copper of nets in `keep`.
+fn prepare_board_with(board: &Board, settings: &Settings, around: &[(P2, f64)], keep: &[NetId]) -> (Board, Vec<String>, Vec<String>) {
+    let near = |net: NetId, d: &dyn Fn(P2) -> f64| net != 0 && around.iter().any(|&(c, r)| d(c) < r);
+    let mut forced: Vec<NetId> = settings.forced_nets(board);
+    if forced.is_empty() {
+        return (board.clone(), vec![], vec![]);
+    }
+    for t in &board.tracks {
+        if near(t.net, &|c| crate::geom::point_seg_dist(c, t.a, t.b) - t.width / 2.0) {
+            forced.push(t.net);
+        }
+    }
+    for v in &board.vias {
+        if near(v.net, &|c| c.dist(v.pos) - v.diameter / 2.0) {
+            forced.push(v.net);
+        }
+    }
+    forced.retain(|n| !keep.contains(n));
+    forced.sort_unstable();
+    forced.dedup();
+    if forced.is_empty() {
+        return (board.clone(), vec![], vec![]);
+    }
+    let (nt, nv) = (board.tracks.len(), board.vias.len());
+    let mut parent: Vec<usize> = (0..nt + nv).collect();
+    fn find(p: &mut [usize], mut x: usize) -> usize {
+        while p[x] != x {
+            p[x] = p[p[x]];
+            x = p[x];
+        }
+        x
+    }
+    // Item endpoints keyed by (net, layer, whole-micron position); a via sits on all its layers.
+    let key = |net: NetId, layer: usize, q: P2| (net, layer, (q.x * 1e3).round() as i64, (q.y * 1e3).round() as i64);
+    let mut at: HashMap<(NetId, usize, i64, i64), Vec<usize>> = HashMap::new();
+    for (i, t) in board.tracks.iter().enumerate() {
+        if forced.binary_search(&t.net).is_ok() {
+            at.entry(key(t.net, t.layer, t.a)).or_default().push(i);
+            at.entry(key(t.net, t.layer, t.b)).or_default().push(i);
+        }
+    }
+    for (j, v) in board.vias.iter().enumerate() {
+        if forced.binary_search(&v.net).is_ok() {
+            for l in v.from_layer..=v.to_layer {
+                at.entry(key(v.net, l, v.pos)).or_default().push(nt + j);
+            }
+        }
+    }
+    for ids in at.values() {
+        for w in ids.windows(2) {
+            let (a, b) = (find(&mut parent, w[0]), find(&mut parent, w[1]));
+            parent[a] = b;
+        }
+    }
+    // Tracks ending on another track's interior (T-junctions) belong to its run too.
+    for (i, t) in board.tracks.iter().enumerate() {
+        if forced.binary_search(&t.net).is_err() {
+            continue;
+        }
+        for (k, u) in board.tracks.iter().enumerate() {
+            if k == i || u.net != t.net || u.layer != t.layer {
+                continue;
+            }
+            if [u.a, u.b].iter().any(|&q| crate::geom::point_seg_dist(q, t.a, t.b) < 1e-3) {
+                let (a, b) = (find(&mut parent, i), find(&mut parent, k));
+                parent[a] = b;
+            }
+        }
+    }
+    let seeds: Vec<usize> = (0..nt + nv)
+        .filter(|&i| {
+            if i < nt {
+                let t = &board.tracks[i];
+                forced.binary_search(&t.net).is_ok() && (t.width < settings.min_neck_width - 1e-6 || near(t.net, &|c| crate::geom::point_seg_dist(c, t.a, t.b) - t.width / 2.0))
+            } else {
+                let v = &board.vias[i - nt];
+                forced.binary_search(&v.net).is_ok() && near(v.net, &|c| c.dist(v.pos) - v.diameter / 2.0)
+            }
+        })
+        .collect();
+    let mut gone_roots: Vec<usize> = seeds.iter().map(|&i| find(&mut parent, i)).collect();
+    let forced: Vec<NetId> = {
+        let mut v: Vec<NetId> = seeds.iter().map(|&i| if i < nt { board.tracks[i].net } else { board.vias[i - nt].net }).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    gone_roots.sort_unstable();
+    gone_roots.dedup();
+    let gone: Vec<bool> = (0..nt + nv).map(|i| gone_roots.binary_search(&find(&mut parent, i)).is_ok()).collect();
+    let mut removed: Vec<String> = board.tracks.iter().enumerate().filter(|&(i, _)| gone[i]).map(|(_, t)| t.id.clone()).chain(board.vias.iter().enumerate().filter(|&(j, _)| gone[nt + j]).map(|(_, v)| v.id.clone())).filter(|id| !id.is_empty()).collect();
+    removed.sort();
+    removed.dedup(); // arcs come in as several segments sharing one id
+    let mut b = board.clone();
+    let mut i = 0;
+    b.tracks.retain(|_| {
+        i += 1;
+        !gone[i - 1]
+    });
+    let mut j = 0;
+    b.vias.retain(|_| {
+        j += 1;
+        !gone[nt + j - 1]
+    });
+    (b, forced.iter().map(|&n| board.net_name(n).to_string()).collect(), removed)
+}
+
+/// Mark nets that the final geometry leaves disconnected as incomplete (a terminal reached only
+/// through a stub that failed validation, for example), checked on the board as it will be applied.
+fn verify_connectivity(board: &Board, settings: &Settings, res: &mut RouteResult) {
+    let planes: Vec<(usize, NetId)> = settings.layers.iter().enumerate().filter_map(|(l, c)| c.plane_net.as_ref().and_then(|n| board.net_by_name(n)).map(|n| (l, n))).collect();
+    let after = board_after(board, res);
+    let mut bad: Vec<(NetId, usize)> = crate::drc::unconnected_per_net(&after, settings, &res.segs, &res.vias, &planes)
+        .into_iter()
+        .filter(|&(n, c)| c > 0 && settings.net_selected(board.net_name(n)) && !res.offboard_nets.iter().any(|o| o == board.net_name(n)))
+        .collect();
+    bad.sort_unstable();
+    for (n, c) in bad {
+        let name = board.net_name(n).to_string();
+        if !res.incomplete_nets.contains(&name) {
+            res.log.push(format!("net {name}: {c} pad group(s) still disconnected in the final copper"));
+            res.incomplete_nets.push(name);
+        }
+    }
+}
+
+/// The board as it will be once `res` is applied: its `removed_ids` taken out.
+pub fn board_after(board: &Board, res: &RouteResult) -> Board {
+    let mut b = board.clone();
+    if !res.removed_ids.is_empty() {
+        let gone: HashSet<&str> = res.removed_ids.iter().map(|s| s.as_str()).collect();
+        b.tracks.retain(|t| !gone.contains(t.id.as_str()));
+        b.vias.retain(|v| !gone.contains(v.id.as_str()));
+    }
+    b
+}
+
+impl Router<'_> {
+    /// Pad groups on the board that have no legal grid node at the current pitch.
+    fn unreachable(&self) -> usize {
+        self.tasks.iter().map(|t| t.static_failed).sum()
+    }
+}
+
+/// Auto pitch: when some on-board pads have no legal grid node, try finer pitches (within the
+/// node budget) and keep the one that reaches the most pads.
+fn choose_pitch(board: &Board, settings: &Settings, log: &mut Vec<String>) -> Settings {
+    let mut s = settings.clone();
+    if settings.grid_pitch > 0.0 {
+        return s;
+    }
+    let p0 = settings.effective_pitch(board);
+    let u0 = Router::new(board, &s).unreachable();
+    if u0 == 0 {
+        return s;
+    }
+    let bb = board.bbox();
+    let fits = |p: f64| bb.width() * bb.height() / (p * p) <= settings.max_nodes_per_layer as f64;
+    let mut best = (u0, p0);
+    for p in [0.127, 0.125, 0.1, 0.0635, 0.05, 0.04] {
+        if p >= p0 - 1e-9 || !fits(p) {
+            continue;
+        }
+        s.grid_pitch = p;
+        let u = Router::new(board, &s).unreachable();
+        if u < best.0 {
+            best = (u, p);
+        }
+        if u == 0 {
+            break;
+        }
+    }
+    s.grid_pitch = best.1;
+    if best.1 != p0 {
+        log.push(format!("auto pitch {p0:.4} mm left {u0} pad group(s) without a legal grid node; refined to {:.4} mm ({} left)", best.1, best.0));
+    }
+    s
+}
+
 /// Convenience: route a board start to finish.
 pub fn route_board(board: &Board, settings: &Settings, backend: &mut dyn Backend, cancel: &AtomicBool, progress: &mut dyn FnMut(Progress)) -> Result<RouteResult> {
+    let original = board;
+    let mut around: Vec<(P2, f64)> = Vec::new();
+    let mut keep: Vec<NetId> = Vec::new();
+    let mut pre_log = Vec::new();
+    // Force re-route: if a ripped connection's pad cannot be reached at the minimum neck-down
+    // (other nets' copper in the way), rip those neighbours too, a little wider each round.
+    let (mut board, mut rerouted_nets, mut removed_ids) = prepare_board_with(original, settings, &around, &keep);
+    let mut settings_eff = choose_pitch(&board, settings, &mut pre_log);
+    if !rerouted_nets.is_empty() {
+        for round in 1..=4 {
+            let probe = Router::new(&board, &settings_eff);
+            let stuck: Vec<usize> = probe.unreachable_pads.iter().copied().filter(|&p| rerouted_nets.iter().any(|n| n == original.net_name(original.pads[p].net))).collect();
+            if stuck.is_empty() {
+                break;
+            }
+            let r = 0.6 * round as f64;
+            around.extend(stuck.iter().map(|&p| (original.pads[p].pos, r)));
+            if round == 4 {
+                // Still unreachable: keep these nets' existing copper rather than lose connections.
+                keep.extend(stuck.iter().map(|&p| original.pads[p].net));
+                keep.sort_unstable();
+                keep.dedup();
+                pre_log.push(format!("force re-route: kept the existing copper of {} (no route at {:.3} mm minimum neck-down)", keep.iter().map(|&n| original.net_name(n)).collect::<Vec<_>>().join(", "), settings.min_neck_width));
+            }
+            (board, rerouted_nets, removed_ids) = prepare_board_with(original, settings, &around, &keep);
+            settings_eff = choose_pitch(&board, settings, &mut pre_log);
+        }
+        pre_log.insert(0, format!("force re-route: {} net(s) ripped up and re-routed at a {:.3} mm minimum neck-down: {}", rerouted_nets.len(), settings.min_neck_width, rerouted_nets.join(", ")));
+    }
+    let settings = &settings_eff;
+    let board = &board;
     let mut r = Router::new(board, settings);
+    r.log.splice(0..0, pre_log);
     progress(Progress {
         phase: "prepared".into(),
         iteration: 0,
@@ -1495,6 +1739,35 @@ pub fn route_board(board: &Board, settings: &Settings, backend: &mut dyn Backend
         preview: None,
     });
     r.route(backend, cancel, progress)?;
-    Ok(r.result())
+    let mut res = r.result();
+    res.removed_ids = removed_ids.clone();
+    verify_connectivity(original, settings, &mut res);
+    let mut log = res.log.clone();
+    // A ripped net that did not complete would lose connections when its old copper is deleted:
+    // keep that copper and route once more.
+    for _ in 0..4 {
+        let failed: Vec<NetId> = rerouted_nets.iter().filter(|n| res.incomplete_nets.contains(n)).filter_map(|n| original.net_by_name(n)).collect();
+        if failed.is_empty() {
+            break;
+        }
+        keep.extend(failed);
+        keep.sort_unstable();
+        keep.dedup();
+        let (b2, nets2, ids2) = prepare_board_with(original, settings, &around, &keep);
+        let mut r2 = Router::new(&b2, settings);
+        r2.log.splice(0..0, log.iter().cloned());
+        r2.log.push(format!("force re-route: {} could not be completed; kept their existing copper and routed again", keep.iter().map(|&n| original.net_name(n)).collect::<Vec<_>>().join(", ")));
+        r2.route(backend, cancel, progress)?;
+        res = r2.result();
+        rerouted_nets = nets2;
+        removed_ids = ids2;
+        res.removed_ids = removed_ids.clone();
+        verify_connectivity(original, settings, &mut res);
+        log = res.log.clone();
+    }
+    res.log = log;
+    res.rerouted_nets = rerouted_nets;
+    res.removed_ids = removed_ids;
+    Ok(res)
 }
 

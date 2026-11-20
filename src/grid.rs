@@ -12,7 +12,7 @@
 //! node checks also cover the segments between nodes.
 
 use crate::board::{Board, NetId, PadKind};
-use crate::geom::{BBox, P2, Shape};
+use crate::geom::{BBox, P2, Polygon, Shape};
 use crate::settings::Settings;
 use rayon::prelude::*;
 
@@ -117,6 +117,82 @@ pub struct StaticMaps {
     pub plane_net: Vec<Option<NetId>>,
     /// Neck-down track width per net class.
     pub neck_w: Vec<f64>,
+    /// Per plane layer: nodes where a via of the plane net lands fully inside the plane's
+    /// copper (its zone fill on that layer, eroded by the via radius). `None` when the board has
+    /// no zone for the plane net on that layer (the whole layer is then taken as copper).
+    pub plane_cover: Vec<Option<Vec<bool>>>,
+}
+
+/// Nodes of one grid layer inside any of `polys` (even-odd over all rings), by scanline.
+fn fill_mask(grid: &Grid, polys: &[&Polygon]) -> Vec<bool> {
+    let mut mask = vec![false; grid.plane()];
+    let mut xs: Vec<f64> = Vec::new();
+    for y in 0..grid.ny {
+        let py = grid.origin.y + y as f64 * grid.pitch;
+        xs.clear();
+        for poly in polys {
+            for ring in std::iter::once(&poly.outline).chain(poly.holes.iter()) {
+                let n = ring.len();
+                for i in 0..n {
+                    let (a, b) = (ring[i], ring[(i + 1) % n]);
+                    if (a.y <= py && py < b.y) || (b.y <= py && py < a.y) {
+                        xs.push(a.x + (py - a.y) * (b.x - a.x) / (b.y - a.y));
+                    }
+                }
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        for pair in xs.chunks_exact(2) {
+            let x0 = ((pair[0] - grid.origin.x) / grid.pitch).ceil().max(0.0) as usize;
+            let x1 = ((pair[1] - grid.origin.x) / grid.pitch).floor();
+            if x1 < 0.0 {
+                continue;
+            }
+            for x in x0..=(x1 as usize).min(grid.nx - 1) {
+                mask[y * grid.nx + x] = true;
+            }
+        }
+    }
+    mask
+}
+
+/// Square erosion by `r` nodes (conservative stand-in for a disc), separable.
+fn erode(grid: &Grid, mask: &[bool], r: usize) -> Vec<bool> {
+    if r == 0 {
+        return mask.to_vec();
+    }
+    let (nx, ny) = (grid.nx, grid.ny);
+    let mut h = vec![false; mask.len()];
+    for y in 0..ny {
+        let row = &mask[y * nx..(y + 1) * nx];
+        // run of consecutive true cells ending at x, from the left and from the right
+        let mut left = vec![0usize; nx];
+        let mut run = 0;
+        for x in 0..nx {
+            run = if row[x] { run + 1 } else { 0 };
+            left[x] = run;
+        }
+        let mut run = 0;
+        for x in (0..nx).rev() {
+            run = if row[x] { run + 1 } else { 0 };
+            h[y * nx + x] = row[x] && left[x] > r && run > r;
+        }
+    }
+    let mut out = vec![false; mask.len()];
+    for x in 0..nx {
+        let mut up = vec![0usize; ny];
+        let mut run = 0;
+        for y in 0..ny {
+            run = if h[y * nx + x] { run + 1 } else { 0 };
+            up[y] = run;
+        }
+        let mut run = 0;
+        for y in (0..ny).rev() {
+            run = if h[y * nx + x] { run + 1 } else { 0 };
+            out[y * nx + x] = h[y * nx + x] && up[y] > r && run > r;
+        }
+    }
+    out
 }
 
 #[inline]
@@ -380,7 +456,27 @@ impl StaticMaps {
             }
         }
 
-        StaticMaps { grid, probes, class_probes, owner, comfort, via_in_pad, routable, plane_net, neck_w }
+        // Plane coverage from the plane net's zone fills (or outlines, if the board gave no fill).
+        let plane_cover: Vec<Option<Vec<bool>>> = (0..nl)
+            .map(|l| {
+                let net = plane_net[l]?;
+                let polys: Vec<&Polygon> = board.zones.iter().filter(|z| z.net == net && z.layers.contains(&l)).map(|z| &z.poly).collect();
+                if polys.is_empty() {
+                    return None;
+                }
+                let nc = settings.netclass(board.nets.get(net as usize).map(|n| n.netclass).unwrap_or(0));
+                let r = ((nc.via_diameter / 2.0) / grid.pitch).ceil() as usize;
+                Some(erode(&grid, &fill_mask(&grid, &polys), r))
+            })
+            .collect();
+
+        StaticMaps { grid, probes, class_probes, owner, comfort, via_in_pad, routable, plane_net, neck_w, plane_cover }
+    }
+
+    /// True if a via of the plane net at plane-local node `p` lands on plane `layer`'s copper.
+    #[inline]
+    pub fn on_plane(&self, layer: usize, p: usize) -> bool {
+        self.plane_cover.get(layer).and_then(|c| c.as_ref()).is_none_or(|m| m[p])
     }
 
     pub fn probes_for(&self, board: &Board, net: NetId) -> ClassProbes {
@@ -451,4 +547,35 @@ pub fn pad_terminal_nodes(board: &Board, maps: &StaticMaps, pad: usize, probe: u
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid10() -> Grid {
+        Grid::new(&BBox { min: P2::new(0.0, 0.0), max: P2::new(10.0, 10.0) }, 1.0, 1, P2::new(0.0, 0.0))
+    }
+
+    #[test]
+    fn scanline_fill_respects_holes() {
+        let g = grid10();
+        let mut poly = Polygon::rect(P2::new(0.5, 0.5), P2::new(8.5, 8.5));
+        poly.holes.push(Polygon::rect(P2::new(3.5, 3.5), P2::new(5.5, 5.5)).outline);
+        let m = fill_mask(&g, &[&poly]);
+        let at = |x: usize, y: usize| m[y * g.nx + x];
+        assert!(at(1, 1) && at(8, 8) && at(2, 6));
+        assert!(!at(0, 0) && !at(9, 9), "outside the outline");
+        assert!(!at(4, 4) && !at(5, 5), "inside the hole");
+    }
+
+    #[test]
+    fn erosion_keeps_only_interior() {
+        let g = grid10();
+        let m = fill_mask(&g, &[&Polygon::rect(P2::new(0.5, 0.5), P2::new(8.5, 8.5))]);
+        let e = erode(&g, &m, 2);
+        let at = |x: usize, y: usize| e[y * g.nx + x];
+        assert!(at(3, 3) && at(6, 6));
+        assert!(!at(1, 4) && !at(7, 4) && !at(4, 2), "within 2 nodes of the edge");
+    }
 }
